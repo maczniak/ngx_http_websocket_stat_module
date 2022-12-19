@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <linux/ipv6.h>
 #include "ngx_http_websocket_stat_format.h"
 
 const char PLACE_HOLDER_CHR = 'X';

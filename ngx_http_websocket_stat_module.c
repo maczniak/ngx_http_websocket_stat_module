@@ -14,8 +14,10 @@
 #define ACCEPT_SIZE 28
 #define GUID_SIZE 36
 // It contains 36 characters.
-char const *const kWsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+char const *const kWsGUID = "369FB0B6-FA25-58EB-A6DB-D6BC1ED96C22";
 char const *const kWsKey = "Sec-WebSocket-Key";
+
+#define TEMPLATE_BUFF_SIZE (4 * 1024)
 
 typedef struct {
     time_t ws_conn_start_time;
@@ -40,6 +42,8 @@ ngx_http_websocket_stat_ctx *stat_counter;
 typedef struct {
     int from_client;
     ngx_http_websocket_stat_ctx *ws_ctx;
+    u_char *buf;
+    size_t pending_size;
 
 } template_ctx_s;
 
@@ -323,6 +327,8 @@ my_send(ngx_connection_t *c, u_char *buf, size_t size)
     template_ctx_s template_ctx;
     template_ctx.from_client = 0;
     template_ctx.ws_ctx = ctx;
+    template_ctx.buf = buffer;
+    template_ctx.pending_size = sz;
     while (sz > 0) {
         if (frame_counter_process_message(&buffer, &sz,
                                           &(ctx->frame_counter))) {
@@ -330,6 +336,7 @@ my_send(ngx_connection_t *c, u_char *buf, size_t size)
             ngx_atomic_fetch_add(frame_counter->total_payload_size,
                                  ctx->frame_counter.current_payload_size);
             ws_do_log(log_template, r, &template_ctx);
+            template_ctx.pending_size = 0;
         }
     }
     int n = orig_send(c, buf, size);
@@ -364,6 +371,8 @@ my_recv(ngx_connection_t *c, u_char *buf, size_t size)
     template_ctx_s template_ctx;
     template_ctx.from_client = 1;
     template_ctx.ws_ctx = ctx;
+    template_ctx.buf = buf;
+    template_ctx.pending_size = sz;
     while (sz > 0) {
         if (frame_counter_process_message(&buf, &sz, &ctx->frame_counter)) {
 
@@ -371,6 +380,7 @@ my_recv(ngx_connection_t *c, u_char *buf, size_t size)
             ngx_atomic_fetch_add(frame_counter->total_payload_size,
                                  ctx->frame_counter.current_payload_size);
             ws_do_log(log_template, r, &template_ctx);
+            template_ctx.pending_size = 0;
         }
     }
 
@@ -425,7 +435,7 @@ ngx_http_websocket_stat_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     return ngx_http_next_body_filter(r, in);
 }
 
-char buff[100];
+char buff[TEMPLATE_BUFF_SIZE];
 
 const char *
 ws_packet_type(ngx_http_request_t *r, void *data)
@@ -446,6 +456,56 @@ ws_packet_size(ngx_http_request_t *r, void *data)
     if (!ctx || !frame_cntr)
         return UNKNOWN_VAR;
     sprintf(buff, "%lu", frame_cntr->current_payload_size);
+    return (char *)buff;
+}
+
+const char *
+ws_packet_full_size(ngx_http_request_t *r, void *data)
+{
+    template_ctx_s *ctx = data;
+    ngx_frame_counter_t *frame_cntr = &ctx->ws_ctx->frame_counter;
+    if (!ctx || !frame_cntr)
+        return UNKNOWN_VAR;
+    sprintf(buff, "%lu", ctx->pending_size);
+    return (char *)buff;
+}
+
+u_char mask_buff[TEMPLATE_BUFF_SIZE];
+u_char *unmask(u_char *mask, u_char *s, size_t size) {
+	u_char *p = mask_buff;
+	for (size_t i = 0; i < size; i++) {
+		p[i] = s[i] ^ mask[i % 4];
+	}
+	p[size] = '\0';
+	return mask_buff;
+}
+
+const char *
+ws_packet_full_content(ngx_http_request_t *r, void *data)
+{
+    template_ctx_s *ctx = data;
+    ngx_frame_counter_t *frame_cntr = &ctx->ws_ctx->frame_counter;
+    if (!ctx || !frame_cntr)
+        return UNKNOWN_VAR;
+    if (ctx->pending_size == 0)
+        return "";
+    u_char *buf = ctx->buf;
+    size_t offset = 0;
+    u_char *mask = (u_char *)"\0\0\0\0";
+    if ((buf[1] & 0x7f) == 126) { // PAYLOAD_LEN_LARGE
+        offset = 2;
+    } else if ((buf[1] & 0x7f) == 127) { // PAYLOAD_LEN_HUGE
+        offset = 8;
+    }
+    if (buf[1] & 0x80) { // mask
+        mask = buf + 2 + offset;
+	offset += 4;
+    }
+    snprintf(buff,
+        ctx->pending_size - 2 - offset + 1, // includes NULL
+        "%s",
+        unmask(mask, buf + 2 + offset, // 2 (HEADER + PAYLOAD_LEN)
+               ctx->pending_size - 2 - offset));
     return (char *)buff;
 }
 
@@ -542,6 +602,8 @@ GEN_CORE_GET_FUNC(server_port, "server_port")
 const template_variable variables[] = {
     {VAR_NAME("$ws_opcode"), sizeof("ping") - 1, ws_packet_type},
     {VAR_NAME("$ws_payload_size"), NGX_SIZE_T_LEN, ws_packet_size},
+    {VAR_NAME("$ws_payload_full_size"), NGX_SIZE_T_LEN, ws_packet_full_size},
+    {VAR_NAME("$ws_payload_full_content"), TEMPLATE_BUFF_SIZE, ws_packet_full_content},
     {VAR_NAME("$ws_packet_source"), sizeof("upstream") - 1, ws_packet_source},
     {VAR_NAME("$ws_conn_age"), NGX_SIZE_T_LEN, ws_connection_age},
     {VAR_NAME("$time_local"), sizeof("Mon, 23 Oct 2017 11:27:42 GMT") - 1,
